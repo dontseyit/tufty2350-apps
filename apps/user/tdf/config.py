@@ -3,7 +3,7 @@
 
 # The LAN proxy that scrapes procyclingstats (which sits behind a Cloudflare
 # JS challenge the badge can't pass) and serves the flattened JSON contract.
-PROXY_URL = "http://192.168.0.n:8321/live.json"
+PROXY_URL = "http://192.168.0.127:8321/live.json"
 
 POLL_MS = 10000          # how often the badge polls the proxy
 HTTP_TIMEOUT = 5         # seconds; bounds the GET so a dead proxy can't hang the UI

@@ -21,7 +21,7 @@ PCS (Cloudflare) <-- curl_cffi --> tools/tdf_proxy.py <-- plain HTTP --> badge
 1. `pip install curl_cffi`, then run `python3 tools/tdf_proxy.py` on a machine
    on the same network.
 2. Point [`config.py`](config.py) `PROXY_URL` at it (default
-   `http://192.168.0.n:8321/live.json`).
+   `http://192.168.0.134:8321/live.json`).
 3. Wi-fi credentials are read from **`/system/secrets.py`** — the file you can
    edit directly on the badge's USB drive (`WIFI_SSID` / `WIFI_PASSWORD`), see
    [`secrets.py.example`](../../secrets.py.example). An optional backup network
