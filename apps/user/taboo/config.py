@@ -27,7 +27,7 @@ CATEGORIES = [
 # key lives in secrets.py. The agent takes one Turkish category word and returns
 # JSON: { "cards": [ { "main_word": str, "taboo_words": [str, ...] }, ... ] }.
 API_URL = "https://api.mistral.ai/v1/conversations"
-AGENT_ID = "ag_019e98852d1372c099cc8ff7a3c428fe"
+AGENT_ID = "<SOME-AGENT-ID>"  # replace with your actual agent ID
 AGENT_VERSION = 2
 
 # Persisted card library, on the writable internal flash root (the read-only
