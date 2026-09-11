@@ -8,12 +8,14 @@ rect, clamp, run, ...) and exposes `State` via `from badgeware import State`.
 `install()` reproduces both so an app's `__init__.py` runs unmodified.
 
 Only the slice of the API the target apps actually touch is implemented. Text
-is drawn with a substitute pygame font (the device .ppf pixel fonts are a
-binary format we don't parse); snarky_sciuridae draws no visible text anyway.
+is drawn with the REAL device fonts: tools/ppf.py parses the .ppf bitmaps and
+the shim blits the same glyphs the badge does, so a screenshot can be trusted
+to the pixel when a line is being fitted to a 320x240 screen.
 """
 
 import builtins
 import json
+import os
 import sys
 import types
 
@@ -94,14 +96,70 @@ class _Color:
 color = _Color()
 
 
-class _RoundRect:
-    __slots__ = ("x", "y", "w", "h", "r")
+class _Stroked:
+    """Device API: a shape is filled unless .stroke(n) is called on it, which
+    returns the shape so the two forms read the same at the call site:
+
+        screen.shape(shape.rounded_rectangle(x, y, w, h, 3))
+        screen.shape(shape.rounded_rectangle(x, y, w, h, 3).stroke(2))
+    """
+    line = 0
+
+    def stroke(self, width=1):
+        self.line = max(1, int(width))
+        return self
+
+
+class _RoundRect(_Stroked):
+    __slots__ = ("x", "y", "w", "h", "r", "line")
 
     def __init__(self, x, y, w, h, r=0):
         self.x, self.y, self.w, self.h, self.r = x, y, w, h, r
+        self.line = 0
+
+
+class _Circle(_Stroked):
+    __slots__ = ("cx", "cy", "rad", "line")
+
+    def __init__(self, cx, cy, rad):
+        self.cx, self.cy, self.rad = cx, cy, rad
+        self.line = 0
+
+
+class _Poly(_Stroked):
+    """An arbitrary polygon, which the device offers as shape.custom.
+
+    Added because the simulator did not have it and an app that used it - the
+    clock does, and dwell's TIES page now does - ran perfectly here and would
+    have thrown on the badge, which is the exact failure this simulator exists
+    to prevent.
+    """
+
+    __slots__ = ("points", "line")
+
+    def __init__(self, points):
+        # THE DEVICE WANTS vec2, NOT TUPLES, and it raises a TypeError naming
+        # custom([P1,P2,P3,...]) when it does not get them.  The first version
+        # of this stub took anything two numbers long, so a page built on
+        # tuples drew perfectly here and threw on the badge - which is the
+        # single failure this simulator exists to prevent, committed by the
+        # simulator itself.  Be as strict as the firmware.
+        out = []
+        for p in points:
+            if not (hasattr(p, "x") and hasattr(p, "y")):
+                raise TypeError(
+                    "invalid parameter, expected custom([P1,P2,P3,...]) "
+                    "of vec2 - got %r" % (p,))
+            out.append((float(p.x), float(p.y)))
+        self.points = out
+        self.line = 0
 
 
 class _Shape:
+    @staticmethod
+    def custom(points):
+        return _Poly(points)
+
     @staticmethod
     def rounded_rectangle(x, y, w, h, r=0, *extra_radii):
         # Device supports per-corner radii; we approximate with a single radius.
@@ -110,6 +168,10 @@ class _Shape:
     @staticmethod
     def rectangle(x, y, w, h):
         return _RoundRect(x, y, w, h, 0)
+
+    @staticmethod
+    def circle(cx, cy, rad):
+        return _Circle(cx, cy, rad)
 
 
 shape = _Shape()
@@ -130,6 +192,22 @@ class Img:
     @property
     def height(self):
         return self.surface.get_height()
+
+    def blit(self, img, dst):
+        """Composite another image onto this one, at 1:1.
+
+        This is what an offscreen canvas is for on the badge - compose a
+        character out of six layers once, then draw the result with a single
+        screen.blit thereafter (see the factory apps 30_minutes_to_alpha_centauri
+        and sketchy_sketch, the character creator's gallery, and household's
+        sprites.dress).  The device offers no scaling form here, so neither does
+        this: scale when you blit the finished canvas to the screen.
+        """
+        src = img.surface
+        if getattr(img, "alpha", 255) != 255:
+            src = src.copy()
+            src.set_alpha(img.alpha)
+        self.surface.blit(src, (int(dst.x), int(dst.y)))
 
 
 class _ImageAPI:
@@ -184,6 +262,61 @@ class SpriteSheet:
 # so e.g. tdf's body/mid/hero fonts stay visibly distinct.
 _FONT_HEIGHTS = {"nope": 13, "smart": 16, "bacteria": 20, "ark": 10}
 _font_cache = {}
+_ppf_cache = {}
+
+# THE SIMULATOR DRAWS THE REAL FONTS.  It used to substitute a system typeface
+# at a guessed pixel size, which is fine for "is the text roughly here" and
+# useless for the thing a 320x240 screen actually needs answering: does this
+# line fit.  Every .ppf in the repo is a fixed-size bitmap and tools/ppf.py
+# already parses them for the content build, so the shim renders the same
+# glyphs the badge does and a screenshot can be trusted to the pixel.
+#
+# ONE NUMBER IS STILL A GUESS: the space.  Its glyph is blank and its width is
+# zero in the file, so the firmware supplies a gap we cannot see; ppf.py bounds
+# it at 2..6.  Four is the middle of that, and it is here as a named constant
+# rather than inline so it can be corrected the day somebody measures it on the
+# badge.
+SPACE_ADVANCE = 4
+
+
+class _PpfFont:
+    """A .ppf rendered through the pygame API that Screen.text already uses."""
+
+    def __init__(self, font, scale):
+        self.f = font
+        self.scale = scale
+        self._glyphs = {}
+
+    def size(self, text):
+        return (self.f.measure(str(text), SPACE_ADVANCE) * self.scale,
+                self.f.rows * self.scale)
+
+    def _glyph(self, ch, rgb):
+        key = (ch, rgb)
+        got = self._glyphs.get(key)
+        if got is not None:
+            return got
+        f, s = self.f, self.scale
+        w = f.advance(ch, SPACE_ADVANCE)
+        surf = pygame.Surface((max(1, w * s), f.rows * s), pygame.SRCALPHA)
+        for y in range(f.rows):
+            for x in range(w):
+                if f.pixel(ch, x, y):
+                    surf.fill(rgb, (x * s, y * s, s, s))
+        self._glyphs[key] = surf
+        return surf
+
+    def render(self, text, antialias, rgb):
+        text = str(text)
+        w, h = self.size(text)
+        out = pygame.Surface((max(1, int(w)), max(1, int(h))), pygame.SRCALPHA)
+        x = 0
+        for ch in text:
+            adv = self.f.advance(ch, SPACE_ADVANCE) * self.scale
+            if ch != " ":
+                out.blit(self._glyph(ch, tuple(rgb)), (x, 0))
+            x += adv
+        return out
 
 
 def _font(px):
@@ -204,6 +337,27 @@ def _default_font():
 class _PixelFontAPI:
     def load(self, path):
         name = str(path).split("/")[-1].split(".")[0]
+        key = (name, RENDER_SCALE)
+        got = _ppf_cache.get(key)
+        if got is not None:
+            return got
+        # _translate turns the device path the app asked for into the repo
+        # copy, which is exactly the mapping the rest of the shim uses for
+        # images - so the font the badge would open is the font opened here.
+        full = _translate(str(path))
+        if os.path.exists(full):
+            try:
+                here = os.path.dirname(os.path.abspath(__file__))
+                tools = os.path.normpath(os.path.join(here, "..", ".."))
+                tools = os.path.join(tools, "tools")
+                if tools not in sys.path:
+                    sys.path.insert(0, tools)
+                import ppf as _ppf
+                got = _PpfFont(_ppf.load(full), RENDER_SCALE)
+                _ppf_cache[key] = got
+                return got
+            except Exception as exc:      # a corrupt font must not stop the app
+                print("sim: could not read %s (%s), falling back" % (full, exc))
         return _font(_FONT_HEIGHTS.get(name, 13) * RENDER_SCALE)
 
 
@@ -284,15 +438,41 @@ class Screen:
         self.surface.blit(src, (int(dst.x * s), int(dst.y * s)))
 
     def shape(self, sh):
-        # Filled (possibly translucent) rounded rectangle in the current pen.
+        # A rounded rectangle or a circle in the current pen, filled unless the
+        # shape was .stroke()d.  Drawn onto a scratch surface first so a
+        # translucent pen composites once rather than per primitive.
         s = self.scale
+        if isinstance(sh, _Poly):
+            pts = [(int(x * s), int(y * s)) for x, y in sh.points]
+            if len(pts) < 2:
+                return
+            w = max(1, int(sh.line * s)) if sh.line else 0
+            if w:
+                # A stroked custom shape is an open path on the device, not a
+                # closed outline: the clock draws seven-segment strokes with it.
+                pygame.draw.lines(self.surface, self.pen, False, pts, w)
+            else:
+                if len(pts) >= 3:
+                    pygame.draw.polygon(self.surface, self.pen, pts)
+            return
+        if isinstance(sh, _Circle):
+            rad = int(sh.rad * s)
+            if rad <= 0:
+                return
+            tmp = pygame.Surface((rad * 2 + 2, rad * 2 + 2), pygame.SRCALPHA)
+            pygame.draw.circle(tmp, self.pen, (rad + 1, rad + 1), rad,
+                               min(rad, int(sh.line * s)) if sh.line else 0)
+            self.surface.blit(tmp, (int(sh.cx * s) - rad - 1,
+                                    int(sh.cy * s) - rad - 1))
+            return
         tw, th = int(abs(sh.w) * s), int(abs(sh.h) * s)
         if tw <= 0 or th <= 0:
             return
         tmp = pygame.Surface((tw, th), pygame.SRCALPHA)
         r = int(min(sh.r * s, tw // 2, th // 2))
+        width = min(tw // 2, th // 2, int(sh.line * s)) if sh.line else 0
         pygame.draw.rect(tmp, self.pen, pygame.Rect(0, 0, tw, th),
-                         border_radius=max(0, r))
+                         width=max(0, width), border_radius=max(0, r))
         self.surface.blit(tmp, (int(sh.x * s), int(sh.y * s)))
 
     def text(self, s, x, y):
@@ -336,6 +516,11 @@ class Badge:
         self._pressed = set()
         self._held = set()
         self._released = set()
+        # The colour the device clears the screen to before every frame.  Apps
+        # may set it; the frame wrapper in get_callback() uses it, which is
+        # what makes this shim clear the way the badge does.
+        self.default_clear = (0, 0, 0, 255)
+        self.default_pen = (255, 255, 255, 255)
 
     @property
     def ticks(self):
@@ -434,7 +619,29 @@ def run(update):
 
 
 def get_callback():
-    return _run_callback
+    """The app's per-frame callback, wrapped so the SCREEN IS CLEARED FIRST.
+
+    The device clears the whole screen before every frame - read back off
+    `screen.raw`, a rectangle drawn and then `badge.update()` and the pixel is
+    gone, replaced by `badge.default_clear`.  A pygame surface does not do
+    that, and the difference hid a real bug: an app that drew its room every
+    frame and its text only when the text changed looked perfect here and
+    flickered on the badge, because something drawn on one frame in three is on
+    screen one frame in three.
+
+    So the shim does what the device does.  Every app in this repo redraws
+    everything every frame, so nothing is broken by it - and the next person to
+    try a partial repaint finds out on a desktop instead of on hardware.
+    """
+    if _run_callback is None:
+        return None
+
+    def framed():
+        screen.pen = badge.default_clear
+        screen.clear()
+        _run_callback()
+
+    return framed
 
 
 def get_app_globals():
